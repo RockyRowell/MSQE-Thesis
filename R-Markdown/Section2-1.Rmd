@@ -1,0 +1,554 @@
+---
+title: "Section 2.1 - Game-Level Analysis: Baseline Ragression"
+author: "Rocky Rowell"
+date: "2026-06-10"
+output: pdf_document
+---
+
+***
+# Description
+This file is the third analysis file and the first of the game-level analysis 
+(Section 2). This file only contains the baseline game-level regression model 
+used in the thesis. This model takes all games that appear on both Steam and Epic 
+and run a regression model to determine the effect of Epic entry. The model is run 
+for four different pre/post windows (30, 60, 90, and 180 days). Although the specifics 
+of the model changed frequently over the course of the project, the final model 
+included time and game fixed effects.
+
+# Notes / Important Information
+- Made the decision to drop Puzzle and Rougelike due to their low
+observation count (n=12 and n=15)     
+- Dropped Time_Since_Release from the regression models due to the unlikelihood
+of depreciation occurring in the time window. Significance of post variables do
+not change.     
+
+***
+# Setup and Data Cleaning
+```{r message=FALSE, warning=FALSE}
+# Libraries
+library(tidyverse)
+library(fixest)
+library(broom)
+library(ggplot2)
+library(flextable)
+library(modelsummary)
+library(stargazer)
+
+# Data
+data <- read_csv("Data/cleaned_data.csv")
+```
+
+## Find Epic Entry Date for each Game
+```{r}
+epic_entry_dates <- data %>%
+  filter(shop_name == "Epic") %>%
+  group_by(game_title) %>%
+  # entry date = first date the game appears on Epic
+  summarise(entry_date = min(date), .groups = "drop")
+```
+
+## Genre columns and window vector
+```{r}
+genre_cols <- c("RPG","Action","Adventure","Shooter","Strategy","Simulation",
+                "Platformer","Horror","OpenWorld","Survival"
+                ,"Multiplayer","Narrative")
+
+# the four pre/post windows used throughout this file
+windows <- c(30, 60, 90, 180)
+
+# the widest window we ever need; build the panel once at this width and
+# subset to narrower windows on demand (avoids rebuilding the panel 4x)
+max_window <- max(windows)
+```
+
+## Build Steam panel at the widest window
+```{r}
+steam_panel <- data %>%
+  filter(shop_name == "Steam") %>%
+  left_join(epic_entry_dates, by = "game_title") %>%
+  mutate(
+    days_since_entry = as.numeric(date - entry_date),
+    ever_treated     = !is.na(entry_date),
+    post             = if_else(ever_treated, days_since_entry >= 0, FALSE)
+  ) %>%
+  filter(!ever_treated | abs(days_since_entry) <= max_window) %>%
+  group_by(game_title, date) %>%
+  summarise(
+    price            = mean(price, na.rm = TRUE),
+    discount_percent = mean(discount_percent, na.rm = TRUE),
+    entry_date       = first(entry_date),
+    release_date     = first(release_date),
+    days_since_entry = first(days_since_entry),
+    ever_treated     = first(ever_treated),
+    post             = first(post),
+    across(all_of(genre_cols), first),
+    sale             = first(sale),
+    .groups          = "drop"
+  )
+```
+
+## Clean up Loose Ends
+Some games caused issues due to lack of price variation or other issues.
+```{r}
+# Book of Demons: convert sub-$5 records to 4.99
+steam_panel <- steam_panel %>%
+  mutate(price = if_else(game_title == "Book of Demons" & price < 5, 4.99, price))
+
+# drop problematic titles
+steam_panel <- steam_panel %>%
+  filter(!game_title %in% c("Dying Light", "Grounded", "The Sims 4"))
+```
+
+## Add Analysis Variables (treated games only)
+```{r}
+treated_panel <- steam_panel %>%
+  filter(ever_treated) %>%
+  mutate(
+    on_epic            = as.integer(days_since_entry >= 0),
+    time_since_release = as.numeric(date - release_date),
+    period             = if_else(days_since_entry < 0, "pre", "post"),
+    cal_week           = as.integer(floor(as.numeric(date - min(date)) / 7))
+  )
+
+cat("Treated games (180-day panel):", n_distinct(treated_panel$game_title), "\n")
+```
+
+
+***
+# Regression Analysis
+Similar to Section 1's regression model, I included different variations (no game 
+FE) of the regression models in the code despite not using them in the thesis.
+
+## 1. Helper: run base + genre regression for one outcome at one window
+```{r}
+genre_inter <- paste0("on_epic:", genre_cols, collapse = " + ")
+
+run_regs <- function(df, outcome_col, w) {
+  d <- df %>% filter(abs(days_since_entry) <= w)
+
+  base <- feols(
+    as.formula(paste(outcome_col,
+                     "~ on_epic | game_title + cal_week")),
+    data = d, cluster = ~ game_title
+  )
+
+  genre <- feols(
+    as.formula(paste(outcome_col,
+                     "~ on_epic +", genre_inter,
+                     "| game_title + cal_week")),
+    data = d, cluster = ~ game_title
+  )
+
+  list(base = base, genre = genre)
+}
+```
+
+## 2. Price regressions across windows
+```{r message=FALSE, warning=FALSE}
+price_models <- map(windows, ~ run_regs(treated_panel, "price", .x))
+names(price_models) <- paste0("w", windows)
+
+# Base Model
+etable(map(price_models, "base"),
+       headers = paste0(windows, "d"),
+       title  = "Price ~ on_epic (base) across windows")
+```
+
+```{r}
+# Genre Model
+etable(map(price_models, "genre"),
+       headers = paste0(windows, "d"),
+       title  = "Price ~ on_epic + genres across windows")
+```
+
+## 3. Sale-frequency regressions across windows
+```{r}
+sale_models <- map(windows, ~ run_regs(treated_panel, "sale", .x))
+names(sale_models) <- paste0("w", windows)
+
+etable(map(sale_models, "base"),
+       headers = paste0(windows, "d"),
+       title  = "Sale ~ on_epic (base) across windows")
+```
+
+```{r}
+etable(map(sale_models, "genre"),
+       headers = paste0(windows, "d"),
+       title  = "Sale ~ on_epic + genres across windows")
+```
+
+## 4. Discount-depth regressions across windows
+```{r}
+disc_models <- map(windows, ~ run_regs(treated_panel, "discount_percent", .x))
+names(disc_models) <- paste0("w", windows)
+
+etable(map(disc_models, "base"),
+       headers = paste0(windows, "d"),
+       title  = "Discount % ~ on_epic (base) across windows")
+```
+
+```{r}
+etable(map(disc_models, "genre"),
+       headers = paste0(windows, "d"),
+       title  = "Discount % ~ on_epic + genres across windows")
+```
+
+## 5. Persistence figure: on_epic coefficient vs window length
+```{r fig.width=8, fig.height=5}
+collect_on_epic <- function(models, label) {
+  map_dfr(names(models), function(nm) {
+    m <- models[[nm]]$base
+    ct <- tidy(m) %>% filter(term == "on_epic")
+    tibble(
+      outcome = label,
+      window  = as.integer(str_remove(nm, "w")),
+      estimate = ct$estimate,
+      se       = ct$std.error
+    )
+  })
+}
+
+persistence <- bind_rows(
+  collect_on_epic(price_models, "Price"),
+  collect_on_epic(sale_models,  "Sale Frequency"),
+  collect_on_epic(disc_models,  "Discount Depth")
+)
+
+ggplot(persistence, aes(x = window, y = estimate)) +
+  geom_ribbon(aes(ymin = estimate - 1.96 * se,
+                  ymax = estimate + 1.96 * se),
+              alpha = 0.2, fill = "steelblue") +
+  geom_line(color = "steelblue", linewidth = 0.8) +
+  geom_point(size = 2, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ outcome, scales = "free_y") +
+  scale_x_continuous(breaks = windows) +
+  labs(
+    title    = "Epic-Entry Effect by Window Length (base specifications)",
+    subtitle = "on_epic coefficient with 95% CI | treated games only",
+    x        = "Window length (days pre/post)",
+    y        = "on_epic coefficient"
+  ) +
+  theme_minimal()
+```
+
+
+***
+# Clean Regression Output
+Like Section 1, I needed to make sure that my regression output could be used in 
+actual thesis. These are just the Word outputs for the regression models.
+
+```{r}
+genre_price <- map(price_models, "genre")
+genre_sale  <- map(sale_models,  "genre")
+genre_disc  <- map(disc_models,  "genre")
+names(genre_price) <- names(genre_sale) <- names(genre_disc) <-
+  paste0(windows, "d")
+
+make_genre_table <- function(mods, caption) {
+  modelsummary(
+    mods,
+    coef_map = c("on_epic" = "On Epic (post-entry)"),
+    gof_omit = "AIC|BIC|Log.Lik.|RMSE|Std.Errors",
+    stars    = c('*' = .05, '**' = .01, '***' = .001),
+    title    = caption,
+    notes    = paste("Genre x on_epic interactions estimated but omitted",
+                     "from display. FE: game + calendar week.",
+                     "SEs clustered by game."),
+    output   = "flextable"
+  ) %>%
+    flextable::autofit()
+}
+
+price_genre_ft <- make_genre_table(genre_price,
+  "Price ~ on_epic (genre-interacted spec; genres omitted)")
+sale_genre_ft  <- make_genre_table(genre_sale,
+  "Sale frequency ~ on_epic (genre-interacted spec; genres omitted)")
+disc_genre_ft  <- make_genre_table(genre_disc,
+  "Discount depth ~ on_epic (genre-interacted spec; genres omitted)")
+
+price_genre_ft
+sale_genre_ft
+disc_genre_ft
+save_as_docx(price_genre_ft, sale_genre_ft, disc_genre_ft,
+             path = "Output/tab_genre_regs.docx")
+```
+
+```{r}
+base_price <- map(price_models, "base")
+base_sale  <- map(sale_models,  "base")
+base_disc  <- map(disc_models,  "base")
+
+# window labels straight off the model lists (length-safe): "30d","60d",...
+lab <- paste0(sub("^w", "", names(price_models)), "d")
+names(base_price) <- names(base_sale) <- names(base_disc) <- lab
+
+make_base_table <- function(mods, caption) {
+  modelsummary(
+    mods,
+    coef_map = c("on_epic" = "On Epic (post-entry)"),
+    gof_omit = "^R2$|R2 Adj\\.|R2 Within Adj\\.|AIC|BIC|Log\\.Lik\\.|RMSE|Std\\.Errors|FE:",
+    stars    = c('*' = .05, '**' = .01, '***' = .001),
+    title    = caption,
+    output   = "flextable"
+  ) %>%
+    flextable::autofit()
+}
+
+price_base_ft <- make_base_table(base_price, "Price ~ On_Epic")
+sale_base_ft  <- make_base_table(base_sale,  "Sale Frequency ~ On_Epic")
+disc_base_ft  <- make_base_table(base_disc,  "Discount Depth ~ On_Epic")
+
+price_base_ft; sale_base_ft; disc_base_ft
+save_as_docx(price_base_ft, sale_base_ft, disc_base_ft,
+             path = "Output/tab_base_regs.docx")
+```
+
+
+***
+# Extra Information and Code
+## Sample Diagnostics
+```{r}
+steam_panel %>%
+  filter(ever_treated) %>%        # or remove this to check all games
+  distinct(game_title, .keep_all = TRUE) %>%
+  summarise(across(all_of(genre_cols), sum, na.rm = TRUE)) %>%
+  pivot_longer(everything(), names_to = "genre", values_to = "n_games") %>%
+  arrange(desc(n_games))
+```
+
+```{r}
+steam_panel %>%
+  distinct(game_title, ever_treated, .keep_all = TRUE) %>%
+  group_by(ever_treated) %>%
+  summarise(across(all_of(genre_cols), sum, na.rm = TRUE)) %>%
+  pivot_longer(-ever_treated, names_to = "genre", values_to = "n_games") %>%
+  pivot_wider(names_from = ever_treated, values_from = n_games,
+              names_prefix = "treated_") %>%
+  mutate(ratio = round(treated_FALSE / treated_TRUE, 1)) %>%
+  arrange(ratio)
+```
+
+## T-Test Analysis
+Originally, I had also included a t-test analysis of the outcome variables that 
+compared the Pre-Epic Steam data to the Post-Epic Steam data for each outcome 
+variable. To display these results, I created graphs that plotted the values of
+each t-test in ascending order.
+
+### 1. Helper: run per-game t-tests for one outcome at one window
+```{r echo=TRUE}
+# outcome_col: name of the column to test ("price", "sale", "discount_percent")
+# w:           window length in days
+run_ttests <- function(df, outcome_col, w, label) {
+  df %>%
+    filter(abs(days_since_entry) <= w) %>%
+    group_by(game_title) %>%
+    filter(sum(period == "pre") >= 5, sum(period == "post") >= 5) %>%
+    group_modify(~ {
+      pre  <- .x[[outcome_col]][.x$period == "pre"]
+      post <- .x[[outcome_col]][.x$period == "post"]
+      if (sd(pre) == 0 && sd(post) == 0) return(tibble())
+      tidy(t.test(post, pre, alternative = "two.sided"))
+    }) %>%
+    ungroup() %>%
+    mutate(
+      outcome      = label,
+      window       = w,
+      significant  = p.value < 0.05,
+      direction_up = estimate > 0
+    )
+}
+```
+
+### 2. Run all outcomes across all windows
+```{r echo=TRUE}
+outcome_specs <- tibble(
+  col   = c("price", "sale", "discount_percent"),
+  label = c("Price", "Sale Frequency", "Discount Depth")
+)
+
+# run t-tests (flat games excluded inside helper) 
+ttest_results <- map_dfr(windows, function(w) {
+  map_dfr(seq_len(nrow(outcome_specs)), function(j) {
+    run_ttests(treated_panel, outcome_specs$col[j], w, outcome_specs$label[j])
+  })
+}) %>%
+  mutate(no_change = FALSE)
+
+# identify flat games for every outcome + window combination 
+flat_games <- map_dfr(windows, function(w) {
+  map_dfr(seq_len(nrow(outcome_specs)), function(j) {
+    col   <- outcome_specs$col[j]
+    label <- outcome_specs$label[j]
+
+    treated_panel %>%
+      filter(abs(days_since_entry) <= w) %>%
+      group_by(game_title) %>%
+      filter(sum(period == "pre") >= 5, sum(period == "post") >= 5) %>%
+      summarise(
+        pre_sd  = sd(.data[[col]][period == "pre"],  na.rm = TRUE),
+        post_sd = sd(.data[[col]][period == "post"], na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      filter(pre_sd == 0 & post_sd == 0) %>%
+      mutate(
+        estimate     = 0,
+        p.value      = 1,
+        significant  = FALSE,
+        direction_up = FALSE,
+        no_change    = TRUE,
+        outcome      = label,
+        window       = w
+      ) %>%
+      select(game_title, estimate, p.value, significant,
+             direction_up, no_change, outcome, window)
+  })
+})
+
+# bind together 
+ttest_results <- bind_rows(ttest_results, flat_games)
+
+# sanity check 
+ttest_results %>%
+  count(outcome, window, no_change) %>%
+  pivot_wider(names_from = no_change, values_from = n,
+              names_prefix = "no_change_") %>%
+  arrange(outcome, window)
+```
+
+### 3. Plot helper: one t-test scatter for a given outcome + window
+```{r echo=TRUE}
+plot_ttests <- function(res, outcome_label, w, y_lab) {
+  d <- res %>%
+    filter(outcome == outcome_label, window == w) %>%
+    arrange(estimate) %>%
+    mutate(
+      game_index  = row_number(),
+      color_group = case_when(
+        no_change                        ~ "No change",
+        direction_up  & significant      ~ "Rose (p<0.05)",
+        !direction_up & significant      ~ "Fell (p<0.05)",
+        direction_up  & !significant     ~ "Rose (n.s.)",
+        !direction_up & !significant     ~ "Fell (n.s.)"
+      )
+    )
+
+  ggplot(d, aes(x = game_index, y = estimate)) +
+    geom_point(aes(color = color_group), size = 2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    scale_color_manual(
+      values = c(
+        "No change"     = "gray60",
+        "Fell (n.s.)"   = "#93c4df",
+        "Rose (n.s.)"   = "#f4a582",
+        "Fell (p<0.05)" = "steelblue",
+        "Rose (p<0.05)" = "firebrick"
+      ),
+      name = NULL,
+      drop = FALSE
+    ) +
+    labs(
+      x        = "Games (sorted by change)",
+      y        = y_lab,
+      title    = paste0(outcome_label, " Change Within ", w,
+                        " Days of Epic Entry"),
+      subtitle = paste0("Each point = one game | n = ", nrow(d), " games")
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+```
+
+### 4. Price t-test plots (one per window)
+```{r fig.width=8, fig.height=5, echo=TRUE}
+for (w in windows) {
+  print(plot_ttests(ttest_results, "Price", w,
+                    "Mean price change after Epic entry (USD)"))
+}
+```
+
+### 5. Sale-frequency t-test plots (one per window)
+```{r fig.width=8, fig.height=5, echo=TRUE}
+for (w in windows) {
+  print(plot_ttests(ttest_results, "Sale Frequency", w,
+                    "Mean change in sale frequency after Epic entry"))
+}
+```
+
+### 6. Discount-depth t-test plots (one per window)
+```{r fig.width=8, fig.height=5, echo=TRUE}
+for (w in windows) {
+  print(plot_ttests(ttest_results, "Discount Depth", w,
+                    "Mean change in discount percent after Epic entry"))
+}
+```
+
+### 7. Summary counts across all outcomes and windows
+```{r echo=TRUE}
+ttest_results %>%
+  group_by(outcome, window) %>%
+  summarise(
+    n_games    = n(),
+    n_rose     = sum(direction_up),
+    n_fell     = sum(!direction_up),
+    n_sig_rose = sum(direction_up & significant),
+    n_sig_fell = sum(!direction_up & significant),
+    .groups = "drop"
+  ) %>%
+  arrange(outcome, window)
+```
+
+```{r echo=TRUE}
+ttest_summary <- ttest_results %>%
+  group_by(outcome, window) %>%
+  summarise(
+    n_rose     = sum(direction_up),
+    n_fell     = sum(!direction_up),
+    n_sig_rose = sum(direction_up & significant),
+    n_sig_fell = sum(!direction_up & significant),
+    .groups = "drop"
+  ) %>%
+  mutate(outcome = factor(outcome,
+    levels = c("Price", "Sale Frequency", "Discount Depth"))) %>%
+  arrange(outcome, window)
+
+ttest_ft <- ttest_summary %>%
+  flextable() %>%
+  set_header_labels(
+    outcome    = "Outcome",
+    window     = "Window (days)",
+    n_rose     = "Rose",
+    n_fell     = "Fell",
+    n_sig_rose = "Rose (p<0.05)",
+    n_sig_fell = "Fell (p<0.05)"
+  ) %>%
+  merge_v(j = "outcome") %>%
+  valign(j = "outcome", valign = "top") %>%
+  theme_booktabs() %>%
+  align(j = 2:6, align = "center", part = "all") %>%
+  align(j = "outcome", align = "left", part = "all") %>%
+  autofit() %>%
+  fix_border_issues()
+
+ttest_ft
+save_as_docx(ttest_ft, path = "Output/tab_ttest_summary.docx")
+```
+
+```{r echo=TRUE}
+ttest_summary_df <- ttest_summary %>%
+  mutate(outcome = as.character(outcome)) %>%
+  as.data.frame()
+
+stargazer(
+  ttest_summary_df,
+  summary  = FALSE,
+  rownames = FALSE,
+  type     = "latex",   # "html" to open in Word, "latex" for a PDF build
+  digits   = 0,
+  title    = "T-Test Outcomes",
+  covariate.labels = c("Outcome", " Window (days) ",
+                       " Rose ", " Fell ", " Rose (p<0.05) ", " Fell (p<0.05) "),
+  out = "Output/tab_ttest_summary.html"
+)
+#For Word: type = "html", out = "Output/tab_ttest_summary.html"
+```

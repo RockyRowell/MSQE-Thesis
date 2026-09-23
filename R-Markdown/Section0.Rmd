@@ -1,0 +1,306 @@
+---
+title: "Section 0 - Preliminary Checks"
+author: "Rocky Rowell"
+date: "2026-06-26"
+output: pdf_document
+---
+
+***
+# Description
+This is the first of four analysis files. This file covers the descriptive 
+statistic tables that show demographic differences between Steam-Only and 
+Dual-Platform games in the sample. There are three main tables. The first table 
+compares Steam-Only and Dual-Platform games' average price, real price, sale 
+frequency and discount depth before and after Epic entered the market. The 
+second table compares the release year distribution between the two groups, and 
+the third table compares genre composition.
+
+# Notes / Important Information
+- In Table 1, Pre-Epic includes all games released before Dec 2018 (entry date). 
+  All Dual-Platform games in this section are games that will become Dual-Platform 
+  in the future once Epic launches. As a result of this, the sample size for Pre-Epic 
+  is smaller than the Post-Epic sample size. Additionally, this affects the total 
+  sample values since Pre-Epic contains fewer games than the Post-Epic and Full Sample 
+  sections that include all games from the sample. 
+- Table 1's averages and t-tests are both computed at the game level (one
+  average per game per period). Every game contributes equally regardless
+  of how many days of price data it has.
+- Table 1 stars come from two-sample t-tests comparing the distribution of 
+  game-level means between groups.    
+- Tables 2 and 3 stars come from chi-square tests of independence between group 
+  and the attribute
+- Tables 2 and 3 describe time-invariant game attributes (release year,
+  genre) and also use one row per game.
+
+***
+# Setup and Data Cleaning
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# load libraries
+library(tidyverse)
+library(stargazer)
+
+# load main dataset
+data <- read_csv("Data/cleaned_data.csv")
+
+# establish epic launch date
+epic_launch <- as.Date("2018-12-06")
+
+# establish genre columns
+genre_cols <- c("RPG","Action","Adventure","Shooter","Strategy","Simulation",
+                "Platformer","Puzzle","Horror","OpenWorld","Survival",
+                "Roguelike","Multiplayer","Narrative")
+```
+
+## Epic Entry Dates
+First, I have to obtain the date each Dual-Platform game entered Epic since 
+game has its own entry timeline.
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+epic_entry_dates <- data %>%
+  filter(shop_name == "Epic") %>%
+  group_by(game_title) %>%
+  summarise(entry_date = min(date), .groups = "drop")
+```
+
+## Build Base Steam Panel
+Next, I create the base steam dataset while joining the Epic entry dates
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+steam_base <- data %>%
+  filter(shop_name == "Steam") %>%
+  # Join Epic entry dates
+  left_join(epic_entry_dates, by = "game_title") %>%
+  mutate(
+    # Variable to track if game has ever been on Epic
+    ever_on_epic = !is.na(entry_date),
+    # Variable that tracks Steam-only vs Dual-Platform
+    group        = if_else(ever_on_epic, "Dual-Platform", "Steam-Only"),
+    # Variable for release year
+    release_year = year(release_date)
+  )
+```
+
+## Game-Level Summaries — one row per game per period
+These are used for both the displayed averages and the t-tests in Table 1.
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# Helper to collapse steam_base to game level for a given date filter
+make_game_summary <- function(df) {
+  df %>%
+    group_by(game_title, group, release_year) %>%
+    summarise(
+      avg_price      = mean(price,            na.rm = TRUE),
+      avg_real_price = mean(real_price,       na.rm = TRUE),
+      avg_sale_freq  = mean(sale,             na.rm = TRUE),
+      avg_disc_depth = mean(discount_percent, na.rm = TRUE),
+      across(all_of(genre_cols), first),
+      .groups        = "drop"
+    )
+}
+
+# Pre-Epic: only observations before Dec 2018
+game_summary_preepic <- steam_base %>%
+  filter(date < epic_launch) %>%
+  make_game_summary()
+
+# Post-Epic: only observations after Dec 2018
+game_summary_postepic <- steam_base %>%
+  filter(date >= epic_launch) %>%
+  make_game_summary()
+
+# Full Sample: all observations
+game_summary <- steam_base %>%
+  make_game_summary()
+
+# Game counts for each time group
+n_so_pre    <- sum(game_summary_preepic$group  == "Steam-Only")
+n_dual_pre  <- sum(game_summary_preepic$group  == "Dual-Platform")
+n_so_post   <- sum(game_summary_postepic$group == "Steam-Only")
+n_dual_post <- sum(game_summary_postepic$group == "Dual-Platform")
+n_so_full   <- sum(game_summary$group          == "Steam-Only")
+n_dual_full <- sum(game_summary$group          == "Dual-Platform")
+```
+
+***
+# Table 1: Outcome Variable Comparison
+
+Game-level averages displayed and tested. Each game contributes one mean
+per period. Two-sample t-test compares Dual-Platform vs Steam-Only
+distributions of those game means.
+
+```{r results='asis', echo=TRUE, message=FALSE, warning=FALSE}
+# Row builder that takes the game-level summary for one period
+make_row <- function(var, label, game_df) {
+  # Pull out the variable vectors for each group
+  so_vec   <- game_df[[var]][game_df$group == "Steam-Only"]
+  dual_vec <- game_df[[var]][game_df$group == "Dual-Platform"]
+
+  # Compute means for each group
+  so_mean   <- mean(so_vec,   na.rm = TRUE)
+  dual_mean <- mean(dual_vec, na.rm = TRUE)
+
+  # Run t-test comparing the two groups
+  tt <- t.test(dual_vec, so_vec)
+
+  # Add significance stars based on p-value
+  stars <- case_when(
+    tt$p.value < 0.01 ~ "***",
+    tt$p.value < 0.05 ~ "**",
+    tt$p.value < 0.10 ~ "*",
+    TRUE              ~ ""
+  )
+
+  # Return the row as a character vector
+  c(label,
+    format(round(so_mean,   2), nsmall = 2),
+    format(round(dual_mean, 2), nsmall = 2),
+    paste0(round(dual_mean - so_mean, 2), stars))
+}
+
+# Build combined three-panel matrix
+combined_mat <- rbind(
+  # Pre-Epic
+  c("Pre-Epic Period (before Dec 2018)", "", "", ""),
+  make_row("avg_price",      "  Avg Price (USD)",      game_summary_preepic),
+  make_row("avg_real_price", "  Avg Real Price (USD)", game_summary_preepic),
+  make_row("avg_sale_freq",  "  Sale Frequency",       game_summary_preepic),
+  make_row("avg_disc_depth", "  Discount Depth (%)",   game_summary_preepic),
+  c("  N (games)", as.character(n_so_pre), as.character(n_dual_pre), ""),
+  c("", "", "", ""),
+  # Post-Epic
+  c("Post-Epic Period (after Dec 2018)", "", "", ""),
+  make_row("avg_price",      "  Avg Price (USD)",      game_summary_postepic),
+  make_row("avg_real_price", "  Avg Real Price (USD)", game_summary_postepic),
+  make_row("avg_sale_freq",  "  Sale Frequency",       game_summary_postepic),
+  make_row("avg_disc_depth", "  Discount Depth (%)",   game_summary_postepic),
+  c("  N (games)", as.character(n_so_post), as.character(n_dual_post), ""),
+  c("", "", "", ""),
+  # Full Sample
+  c("Full Sample Period", "", "", ""),
+  make_row("avg_price",      "  Avg Price (USD)",      game_summary),
+  make_row("avg_real_price", "  Avg Real Price (USD)", game_summary),
+  make_row("avg_sale_freq",  "  Sale Frequency",       game_summary),
+  make_row("avg_disc_depth", "  Discount Depth (%)",   game_summary),
+  c("  N (games)", as.character(n_so_full), as.character(n_dual_full), "")
+)
+
+# Set column names for the combined matrix
+colnames(combined_mat) <- c("Variable", "Steam-Only",
+                             "Dual-Platform", "Difference")
+
+# Render the combined matrix as a LaTeX table using stargazer
+stargazer(combined_mat,
+          type        = "latex",
+          title       = "Outcome Variable Comparison by Group",
+          summary     = FALSE,
+          rownames    = FALSE,
+          notes       = "*** p<0.01, ** p<0.05, * p<0.10",
+          notes.align = "l")
+```
+
+***
+# Table 2: Release Year Distribution
+
+Time-invariant attribute. Uses full-sample game_summary so every game
+appears once. Chi-square test per year for compositional differences.
+
+```{r results='asis', echo=TRUE, message=FALSE, warning=FALSE}
+# Gather all unique release years in the dataset
+all_years <- sort(unique(game_summary$release_year))
+
+# Row builder for release year distribution table
+make_year_row <- function(yr) {
+  # Compute the percentage of games released in the given year for each group
+  so_pct   <- mean(game_summary$release_year[game_summary$group == "Steam-Only"]   == yr,
+                   na.rm = TRUE) * 100
+  dual_pct <- mean(game_summary$release_year[game_summary$group == "Dual-Platform"] == yr,
+                   na.rm = TRUE) * 100
+
+  # Run chi-square test for the given year
+  tbl <- table(game_summary$group, game_summary$release_year == yr)
+  chi <- suppressWarnings(chisq.test(tbl))
+
+  # Add significance stars based on p-value
+  stars <- case_when(
+    chi$p.value < 0.01 ~ "***",
+    chi$p.value < 0.05 ~ "**",
+    chi$p.value < 0.10 ~ "*",
+    TRUE               ~ ""
+  )
+
+  # Return the row as a character vector
+  c(as.character(yr),
+    paste0(round(so_pct,   1), "%"),
+    paste0(round(dual_pct, 1), "%"),
+    paste0(round(dual_pct - so_pct, 1), stars))
+}
+
+# Build the release year distribution table
+table2_mat <- do.call(rbind, lapply(all_years, make_year_row))
+colnames(table2_mat) <- c("Release Year", "Steam-Only (%)",
+                           "Dual-Platform (%)", "Difference")
+
+# Render the release year distribution table as a LaTeX table using stargazer
+stargazer(table2_mat,
+          type        = "latex",
+          title       = "Release Year Distribution by Group",
+          summary     = FALSE,
+          rownames    = FALSE,
+          notes       = "*** p<0.01, ** p<0.05, * p<0.10",
+          notes.align = "l")
+```
+
+***
+# Table 3: Genre Distribution
+
+Time-invariant attribute. Uses full-sample game_summary so every game
+appears once. Genres sorted by absolute difference between groups.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, results='asis'}
+# Row builder for genre distribution table
+make_genre_row <- function(g) {
+  # Compute the percentage of games in the given genre for each group
+  so_pct   <- mean(game_summary[[g]][game_summary$group == "Steam-Only"],
+                   na.rm = TRUE) * 100
+  dual_pct <- mean(game_summary[[g]][game_summary$group == "Dual-Platform"],
+                   na.rm = TRUE) * 100
+
+  # Run chi-square test for the given genre
+  tbl <- table(game_summary$group, game_summary[[g]])
+  chi <- suppressWarnings(chisq.test(tbl))
+
+  # Add significance stars based on p-value
+  stars <- case_when(
+    chi$p.value < 0.01 ~ "***",
+    chi$p.value < 0.05 ~ "**",
+    chi$p.value < 0.10 ~ "*",
+    TRUE               ~ ""
+  )
+
+  # Return the row as a list containing genre, difference, and row data
+  list(
+    genre = g,
+    diff  = dual_pct - so_pct,
+    row   = c(g,
+              paste0(round(so_pct,   1), "%"),
+              paste0(round(dual_pct, 1), "%"),
+              paste0(round(dual_pct - so_pct, 1), stars))
+  )
+}
+
+# Build the genre distribution table, sorting by absolute difference
+genre_rows        <- lapply(genre_cols, make_genre_row)
+genre_rows_sorted <- genre_rows[order(sapply(genre_rows, function(x) abs(x$diff)),
+                                       decreasing = TRUE)]
+
+# Combine the sorted rows into a matrix for stargazer
+table3_mat <- do.call(rbind, lapply(genre_rows_sorted, function(x) x$row))
+colnames(table3_mat) <- c("Genre", "Steam-Only (%)",
+                           "Dual-Platform (%)", "Difference")
+
+# Render the genre distribution table as a LaTeX table using stargazer
+stargazer(table3_mat,
+          type        = "latex",
+          title       = "Genre Distribution by Group",
+          summary     = FALSE,
+          rownames    = FALSE,
+          notes       = "*** p<0.01, ** p<0.05, * p<0.10",
+          notes.align = "l")
+```

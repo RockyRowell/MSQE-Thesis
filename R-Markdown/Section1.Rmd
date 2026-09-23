@@ -1,0 +1,757 @@
+---
+title: "Section 1 - Market-Level Analysis"
+author: "Rocky Rowell"
+date: "2026-06-09"
+output: pdf_document
+header-includes:
+  - \usepackage[normalem]{ulem}
+---
+
+***
+# Description
+This file is one of the analysis files in the project. All market-level analysis 
+is conducted in this file. The first form of analysis is a set of exploratory 
+graphs observing each outcome variable over the sample period, grouped by game-age. 
+The second form of analysis is a set of graphs comparing outcome variables for 
+Steam-only, Dual-Platform, and Future Dual-Platform games after Epic's launch, 
+also grouped by game-age. The final form of analysis is a set of regression models
+that examine the change in outcome variable trajectories for Steam-only and 
+Dual-Platform games relative to 2018. These regression models are visualized 
+through a set of graphs.
+
+# Notes / Important Information
+- Although the No-Game-FE models are created in this file, they are not used in 
+the thesis.
+- 2013 dropped from graphs and regressions (low sample size = high volatility). 
+2013 only includes a few weeks of data in this sample, which messes with the graphs. 
+- Regression models account for time trends and seasonality with 
+log(Quarters Since Release) and month-of-year fixed effects
+
+***
+# Setup and Data Cleaning
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# Libraries
+library(tidyverse)
+library(fixest)
+library(ggthemes)
+library(patchwork)
+library(modelsummary)
+library(flextable)
+
+# Data
+data <- read_csv("Data/cleaned_data.csv")
+```
+
+## Shared Globals
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+epic_launch <- as.Date("2018-12-01")
+
+# updated game age windows: 0-6mo, 6mo-2yr, 2yr+
+graph_windows <- list(
+  "0-6 Months" = c(0,   182),
+  "6 Months - 2 Years"  = c(182, 730),
+  "2+ Years"   = c(730, Inf)
+)
+
+genre_cols <- c("RPG","Action","Adventure","Shooter","Strategy","Simulation",
+                "Platformer","Puzzle","Horror","OpenWorld","Survival",
+                "Roguelike","Multiplayer","Narrative")
+```
+
+## Epic Entry Dates
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+epic_entry_dates <- data %>%
+  filter(shop_name == "Epic") %>%
+  group_by(game_title) %>%
+  summarise(entry_date = min(date), .groups = "drop")
+```
+
+***
+# Section 1.1: Full Sample Exploratory Graphs
+
+Monthly average Steam prices, sale frequency, and discount depth. Three
+game-age windows (0-6 months, 6 months to 2 years, 2+ years). Includes
+95% CI ribbons around the trend lines.
+
+## Helper: build monthly panel for a given age range
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+build_window_panel <- function(age_range, min_frac = 0.05) {
+  panel <- data %>%
+    filter(shop_name == "Steam") %>%
+    mutate(days_since_release = as.numeric(date - release_date)) %>%
+    filter(days_since_release >= age_range[1],
+           days_since_release <  age_range[2]) %>%
+    mutate(month = floor_date(date, "month")) %>%
+    filter(month < as.Date("2024-12-01")) %>%
+    group_by(month) %>%
+    summarise(
+      avg_real_price = mean(real_price,       na.rm = TRUE),
+      avg_sale_freq  = mean(sale,             na.rm = TRUE),
+      avg_disc_depth = mean(discount_percent, na.rm = TRUE),
+      n_games        = n_distinct(game_title),
+      .groups        = "drop"
+    ) %>%
+    filter(year(month) > 2013)
+
+  thresh <- median(panel$n_games) * min_frac
+  panel %>%
+    filter(n_games >= thresh) %>%
+    mutate(period = if_else(month < epic_launch, "Pre-Epic", "Post-Epic"))
+}
+```
+
+## Helper: pre/post period averages for annotation
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+compute_period_avgs <- function(df) {
+  df %>%
+    group_by(period) %>%
+    summarise(
+      avg_real_price = mean(avg_real_price, na.rm = TRUE),
+      avg_sale_freq  = mean(avg_sale_freq,  na.rm = TRUE),
+      avg_disc_depth = mean(avg_disc_depth, na.rm = TRUE),
+      label_x        = mean(month),
+      .groups        = "drop"
+    )
+}
+```
+
+## Helper: single-outcome plot for one window (with 95% CI)
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+plot_window_outcome <- function(df, period_avgs, outcome_col, y_lab,
+                                window_label, label_format = "raw") {
+  label_df <- period_avgs %>%
+    mutate(
+      lbl = case_when(
+        label_format == "dollar"  ~ paste0("Avg: $", round(.data[[outcome_col]], 2)),
+        label_format == "percent" ~ paste0("Avg: ",  round(.data[[outcome_col]], 2), "%"),
+        TRUE                      ~ paste0("Avg: ",  round(.data[[outcome_col]], 2))
+      )
+    )
+
+  ggplot(df, aes(x = month, y = .data[[outcome_col]])) +
+    geom_line(color = "steelblue", linewidth = 0.6) +
+    geom_smooth(aes(group = period), method = "lm", se = TRUE,
+                color = "firebrick", fill = "firebrick",
+                alpha = 0.15, linewidth = 0.9) +
+    geom_vline(xintercept = epic_launch,
+               linetype = "dashed", color = "black") +
+    geom_label(data = label_df,
+               aes(x = label_x, y = .data[[outcome_col]], label = lbl),
+               color = "firebrick", size = 3, fill = "white") +
+    labs(
+      subtitle = window_label,
+      x = NULL, y = y_lab
+    ) +
+    theme_fivethirtyeight() +
+    theme(
+      plot.subtitle = element_text(face = "bold", hjust = 0.5),
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "#F7F7F7", color = NA)
+      )
+}
+```
+
+## Build all three window datasets and period averages
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+window_data <- map(graph_windows, build_window_panel)
+window_avgs <- map(window_data, compute_period_avgs)
+```
+
+## Real Price Plots
+```{r fig.width=12, fig.height=4, echo=TRUE, message=FALSE, warning=FALSE}
+p_price <- map2(names(window_data), window_data, function(nm, df) {
+  plot_window_outcome(df, window_avgs[[nm]], "avg_real_price",
+                      "Avg Real Price (USD)", nm, label_format = "dollar")
+})
+
+(p_price[[1]] | p_price[[2]] | p_price[[3]]) +
+  plot_annotation(
+    title    = "Monthly Average Real Price on Steam",
+    subtitle = "By game age window | dashed = Epic launch"
+  ) &
+  coord_cartesian(ylim = c(10, 35))
+```
+
+## Sale Frequency Plots
+```{r fig.width=12, fig.height=4, echo=TRUE, message=FALSE, warning=FALSE}
+p_sale <- map2(names(window_data), window_data, function(nm, df) {
+  plot_window_outcome(df, window_avgs[[nm]], "avg_sale_freq",
+                      "Avg Sale Frequency", nm, label_format = "raw")
+})
+
+(p_sale[[1]] | p_sale[[2]] | p_sale[[3]]) +
+  plot_annotation(
+    title    = "Monthly Average Sale Frequency on Steam",
+    subtitle = "By game age window | dashed = Epic launch"
+  ) &
+  coord_cartesian(ylim = c(0, .55))
+```
+
+## Discount Depth Plots
+```{r fig.width=12, fig.height=4, echo=TRUE, message=FALSE, warning=FALSE}
+p_disc <- map2(names(window_data), window_data, function(nm, df) {
+  plot_window_outcome(df, window_avgs[[nm]], "avg_disc_depth",
+                      "Avg Discount Depth (%)", nm, label_format = "percent")
+})
+
+(p_disc[[1]] | p_disc[[2]] | p_disc[[3]]) +
+  plot_annotation(
+    title    = "Monthly Average Discount Depth on Steam",
+    subtitle = "By game age window | dashed = Epic launch"
+  ) &
+  coord_cartesian(ylim = c(0, 32))
+```
+
+
+***
+# Section 1.2: Steam-Only vs Dual-Platform vs Future Dual-Platform
+
+Restricts to the post-Epic-launch period and splits the Steam catalog into
+three groups:
+- Steam-Only: never joins Epic
+- Dual-Platform: currently listed on Epic (date >= entry_date)
+- Future Dual-Platform: will join Epic but has not yet (date < entry_date,
+  entry_date not NA)
+
+Same age windows as above. Includes 95% CI ribbons.
+
+## Helper: build post-launch panel with three groups
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+build_postlaunch_panel <- function(age_range, min_frac = 0.05) {
+  panel <- data %>%
+    filter(shop_name == "Steam") %>%
+    mutate(days_since_release = as.numeric(date - release_date)) %>%
+    filter(days_since_release >= age_range[1],
+           days_since_release <  age_range[2]) %>%
+    filter(date >= epic_launch) %>%
+    left_join(epic_entry_dates, by = "game_title") %>%
+    mutate(
+      group = case_when(
+        is.na(entry_date)          ~ "Steam-Only",
+        date >= entry_date         ~ "Dual-Platform",
+        date <  entry_date         ~ "Future Dual-Platform",
+        TRUE                       ~ NA_character_
+      ),
+      month = floor_date(date, "month")
+    ) %>%
+    filter(month < as.Date("2024-12-01")) %>%
+    group_by(group, month) %>%
+    summarise(
+      avg_real_price = mean(real_price,       na.rm = TRUE),
+      avg_sale_freq  = mean(sale,             na.rm = TRUE),
+      avg_disc_depth = mean(discount_percent, na.rm = TRUE),
+      n_games        = n_distinct(game_title),
+      .groups        = "drop"
+    )
+
+  # Drop sparse months WITHIN each group (per-group median, so each
+  # series is trimmed on its own scale rather than a pooled one)
+  panel %>%
+    group_by(group) %>%
+    filter(n_games >= median(n_games) * min_frac) %>%
+    ungroup()
+}
+```
+
+## Helper: % of Dual/Future-DP games actually on Epic within window
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+pct_on_epic_in_window <- function(age_range) {
+  data %>%
+    filter(shop_name == "Steam") %>%
+    distinct(game_title, release_date) %>%
+    left_join(epic_entry_dates, by = "game_title") %>%
+    filter(!is.na(entry_date)) %>%
+    mutate(
+      days_to_epic      = as.numeric(entry_date - release_date),
+      on_epic_in_window = days_to_epic >= age_range[1] &
+                           days_to_epic <  age_range[2]
+    ) %>%
+    summarise(pct = mean(on_epic_in_window, na.rm = TRUE) * 100) %>%
+    pull(pct) %>%
+    round(1)
+}
+```
+
+## Helper: three-group plot with 95% CI ribbons
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+plot_group_comparison <- function(df, outcome_col, y_lab,
+                                  window_label, pct_on_epic) {
+  ggplot(df, aes(x = month, y = .data[[outcome_col]], color = group, fill = group)) +
+    geom_line(linewidth = 0.5, alpha = 0.5) +
+    geom_smooth(method = "lm", se = TRUE, linewidth = 0.9, alpha = 0.15) +
+    scale_color_manual(
+      values = c("Steam-Only"           = "steelblue",
+                 "Dual-Platform"        = "firebrick",
+                 "Future Dual-Platform" = "darkorange"),
+      name   = NULL
+    ) +
+    scale_fill_manual(
+      values = c("Steam-Only"           = "steelblue",
+                 "Dual-Platform"        = "firebrick",
+                 "Future Dual-Platform" = "darkorange"),
+      name   = NULL
+    ) +
+    labs(
+      subtitle = paste0(window_label),
+      x = NULL, y = y_lab
+    ) +
+    theme_fivethirtyeight() +
+    theme(
+      plot.subtitle = element_text(face = "bold", hjust = 0.5),
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "#F7F7F7", color = NA),
+      legend.position  = "bottom",
+      legend.background = element_rect(fill = NA, color = NA),
+      legend.key        = element_rect(fill = NA, color = NA)
+      )
+}
+```
+
+## Build post-launch datasets
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+postlaunch_data <- map(graph_windows, build_postlaunch_panel)
+postlaunch_pct  <- map(graph_windows, pct_on_epic_in_window)
+```
+
+## Real Price Comparison
+```{r fig.width=13, fig.height=4.5, echo=TRUE, message=FALSE, warning=FALSE}
+pl_price <- map2(names(postlaunch_data), postlaunch_data, function(nm, df) {
+  plot_group_comparison(df, "avg_real_price", "Avg Real Price (USD)",
+                        nm, postlaunch_pct[[nm]])
+})
+
+(pl_price[[1]] | pl_price[[2]] | pl_price[[3]]) +
+  plot_annotation(
+    title    = "Post-Launch Real Price on Steam",
+    subtitle = "By Game Age Window | Trend lines with 95% CI"
+  ) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom") &
+  coord_cartesian(ylim = c(10, 55))
+```
+
+## Sale Frequency Comparison
+```{r fig.width=13, fig.height=4.5, echo=TRUE, message=FALSE, warning=FALSE}
+pl_sale <- map2(names(postlaunch_data), postlaunch_data, function(nm, df) {
+  plot_group_comparison(df, "avg_sale_freq", "Avg Sale Frequency",
+                        nm, postlaunch_pct[[nm]])
+})
+
+(pl_sale[[1]] | pl_sale[[2]] | pl_sale[[3]]) +
+  plot_annotation(
+    title    = "Post-Launch Sale Frequency on Steam",
+    subtitle = "By Game Age Window | Trend lines with 95% CI"
+  ) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom") &
+  coord_cartesian(ylim = c(0, .6))
+```
+
+## Discount Depth Comparison
+```{r fig.width=13, fig.height=4.5, echo=TRUE, message=FALSE, warning=FALSE}
+pl_disc <- map2(names(postlaunch_data), postlaunch_data, function(nm, df) {
+  plot_group_comparison(df, "avg_disc_depth", "Avg Discount Depth (%)",
+                        nm, postlaunch_pct[[nm]])
+})
+
+(pl_disc[[1]] | pl_disc[[2]] | pl_disc[[3]]) +
+  plot_annotation(
+    title    = "Post-Launch Discount Depth on Steam",
+    subtitle = "By Game Age Window | Trend lines with 95% CI"
+  ) +
+  plot_layout(guides = "collect") &
+  theme(legend.position = "bottom") &
+  coord_cartesian(ylim = c(0, 35))
+```
+
+
+***
+# Section 1.3: Regression Models
+
+Two model families per outcome. Model 1 has no game FE with genre controls;
+Model 2 has game FE (genres absorbed).
+
+## Build Regression Dataset
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+reg_data <- data %>%
+  filter(shop_name == "Steam") %>%
+  mutate(month = floor_date(date, "month")) %>%
+  group_by(game_title, month) %>%
+  summarise(
+    avg_real_price = mean(real_price,       na.rm = TRUE),
+    avg_price      = mean(price,            na.rm = TRUE),
+    avg_sale_freq  = mean(sale,             na.rm = TRUE),
+    avg_disc_depth = mean(discount_percent, na.rm = TRUE),
+    release_date   = first(release_date),
+    across(all_of(genre_cols), first),
+    .groups = "drop"
+  ) %>%
+  filter(year(month) > 2013) %>%
+  left_join(epic_entry_dates, by = "game_title") %>%
+  mutate(
+    ever_on_epic           = as.integer(!is.na(entry_date)),
+    year                   = year(month),
+    month_of_year          = month(month),
+    quarters_since_release = as.numeric(month - release_date) / (365.25 / 4),
+    log_qsr                = log(pmax(quarters_since_release, 0) + 1)
+  )
+```
+
+## Helper: run two models for one outcome
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+genre_string <- paste(genre_cols, collapse = " + ")
+
+run_two_models <- function(outcome, tsr_var) {
+  # Model 1: no game FE, with genre + ever_on_epic + year main effects + interactions
+  f1 <- as.formula(paste0(
+    outcome,
+    " ~ i(year, ref = 2018) + ever_on_epic + i(year, ever_on_epic, ref = 2018) + ",
+    tsr_var, " + ", genre_string,
+    " | month_of_year"
+  ))
+  m1 <- feols(f1, data = reg_data, cluster = ~ game_title)
+
+  # Model 2: game FE (absorbs ever_on_epic and genres)
+  f2 <- as.formula(paste0(
+    outcome,
+    " ~ i(year, ref = 2018) + i(year, ever_on_epic, ref = 2018) + ",
+    tsr_var,
+    " | game_title + month_of_year"
+  ))
+  m2 <- feols(f2, data = reg_data, cluster = ~ game_title)
+
+  list(m1 = m1, m2 = m2)
+}
+```
+
+## Nominal Price
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+price_models <- run_two_models("avg_price", "log_qsr")
+
+etable(price_models$m1, price_models$m2,
+       headers = c("No Game FE (Model 1)", "Game FE (Model 2)"),
+       title   = "Nominal Price — Full regression output (for review)")
+```
+
+## Real Price
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+realprice_models <- run_two_models("avg_real_price", "log_qsr")
+
+etable(realprice_models$m1, realprice_models$m2,
+       headers = c("No Game FE (Model 1)", "Game FE (Model 2)"),
+       title   = "Real Price — Full regression output (for review)")
+```
+
+## Sale Frequency
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+sale_models <- run_two_models("avg_sale_freq", "log_qsr")
+
+etable(sale_models$m1, sale_models$m2,
+       headers = c("No Game FE (Model 1)", "Game FE (Model 2)"),
+       title   = "Sale Frequency — Full regression output (for review)")
+```
+
+## Discount Depth
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+disc_models <- run_two_models("avg_disc_depth", "log_qsr")
+
+etable(disc_models$m1, disc_models$m2,
+       headers = c("No Game FE (Model 1)", "Game FE (Model 2)"),
+       title   = "Discount Depth — Full regression output (for review)")
+```
+
+***
+# Section 1.4: Thesis Display Output
+I needed to make Word output of the models for the thesis.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+omit_regex <- paste0("Intercept|^",
+                     paste(genre_cols, collapse = "$|^"),
+                     "$")
+
+coef_rename <- c(
+  "ever_on_epic"           = "Ever on Epic",
+  "log_qsr"                = "Log(Quarters Since Release)",
+  "quarters_since_release" = "Quarters Since Release"
+)
+```
+
+```{r}
+# Game FE models only (m2), one column per outcome
+s1_models <- list(
+  "Nominal Price (USD)" = price_models$m2,
+  "Real Price (USD)"    = realprice_models$m2,
+  "Sale Freq. (share)"    = sale_models$m2,
+  "Discount Depth (pp)"  = disc_models$m2
+)
+
+# Build coef_map programmatically so year effects group first, then the
+# interactions, then the trend. Years derived from the data (length-safe),
+# 2018 dropped as the reference.
+years      <- sort(setdiff(unique(reg_data$year), 2018))
+year_terms <- paste0("year::", years)                  # main effects
+int_terms  <- paste0("year::", years, ":ever_on_epic") # interactions
+
+coef_map <- c(
+  setNames(as.character(years), year_terms),
+  setNames(paste0(years, " x Epic"), int_terms),
+  "log_qsr" = "Log(QSR)"
+)
+
+s1_ft <- modelsummary(
+  s1_models,
+  coef_map = coef_map,
+  gof_omit = "^R2$|R2 Adj\\.|R2 Within Adj\\.|AIC|BIC|Log\\.Lik\\.|RMSE|Std\\.Errors|FE:",
+  stars    = c('*' = .05, '**' = .01, '***' = .001),
+  title    = "Year-Relative Effects on Steam Outcomes",
+  notes    = c(
+    "All models include game and month-of-year fixed effects. Reference year 2018. SEs clustered by game"
+  ),
+  output   = "flextable"
+) %>%
+  flextable::autofit()
+
+s1_ft
+# save table
+save_as_docx(s1_ft, path = "Output/tab_section1_regs.docx")
+```
+
+***
+# Section 1.5: Year-Relative Trajectory Plots
+
+Extracts the year main effects and their interactions from the regression
+models to plot Steam-Only vs Dual-Platform trajectories relative to 2018.
+
+## Helper: extract trajectories with 95% CI
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+extract_trajectories <- function(model, model_label, outcome_label) {
+  V  <- vcov(model)
+  co <- coef(model)
+
+  year_terms <- grep("^year::[0-9]+$", names(co), value = TRUE)
+  years      <- as.numeric(sub("year::", "", year_terms))
+
+  map_dfr(seq_along(year_terms), function(i) {
+    y_term   <- year_terms[i]
+    int_term <- paste0(y_term, ":ever_on_epic")
+
+    so_est <- co[y_term]
+    so_se  <- sqrt(V[y_term, y_term])
+
+    if (int_term %in% names(co)) {
+      dp_est <- co[y_term] + co[int_term]
+      dp_var <- V[y_term, y_term] + V[int_term, int_term] +
+                2 * V[y_term, int_term]
+      dp_se  <- sqrt(dp_var)
+    } else {
+      dp_est <- NA_real_
+      dp_se  <- NA_real_
+    }
+
+    tibble(
+      model      = model_label,
+      outcome    = outcome_label,
+      year       = years[i],
+      steam_only = so_est,
+      so_se      = so_se,
+      dual_plat  = dp_est,
+      dp_se      = dp_se
+    )
+  })
+}
+```
+
+## Build long-form plot dataset
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+plot_data <- bind_rows(
+  # extract_trajectories(price_models$m1,     "No Game FE", "Nominal Price"),
+  extract_trajectories(price_models$m2,     "Game FE",    "Nominal Price"),
+  # extract_trajectories(realprice_models$m1, "No Game FE", "Real Price"),
+  extract_trajectories(realprice_models$m2, "Game FE",    "Real Price"),
+  # extract_trajectories(sale_models$m1,      "No Game FE", "Sale Frequency"),
+  extract_trajectories(sale_models$m2,      "Game FE",    "Sale Frequency"),
+  # extract_trajectories(disc_models$m1,      "No Game FE", "Discount Depth"),
+  extract_trajectories(disc_models$m2,      "Game FE",    "Discount Depth")
+)
+
+# Add reference-year (2018) rows at zero for visual continuity
+ref_year_rows <- plot_data %>%
+  distinct(model, outcome) %>%
+  mutate(year = 2018, steam_only = 0, so_se = 0,
+         dual_plat = 0, dp_se = 0)
+
+plot_data <- bind_rows(plot_data, ref_year_rows) %>%
+  arrange(model, outcome, year)
+
+# Reshape to long form for plotting
+plot_long <- plot_data %>%
+  pivot_longer(cols = c(steam_only, dual_plat),
+               names_to = "group", values_to = "estimate") %>%
+  mutate(
+    se    = if_else(group == "steam_only", so_se, dp_se),
+    group = recode(group,
+                   steam_only = "Steam-Only",
+                   dual_plat  = "Dual-Platform"),
+    ci_lower = estimate - 1.96 * se,
+    ci_upper = estimate + 1.96 * se
+  ) %>%
+  select(model, outcome, year, group, estimate, ci_lower, ci_upper)
+```
+
+## Plot helper (faceted by model, one outcome per plot)
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+plot_trajectories <- function(df, outcome_label) {
+  df %>%
+    filter(outcome == outcome_label) %>%
+    ggplot(aes(x = year, y = estimate, color = group, fill = group)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+    geom_vline(xintercept = 2018.9,
+               linetype = "dotted", color = "black", alpha = 1) +
+    geom_ribbon(aes(ymin = ci_lower, ymax = ci_upper),
+                alpha = 0.15, color = NA) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 2) +
+    # facet_wrap(~ model, nrow = 1) +
+    scale_color_manual(values = c("Steam-Only"    = "steelblue",
+                                   "Dual-Platform" = "firebrick"),
+                       name = NULL) +
+    scale_fill_manual(values  = c("Steam-Only"    = "steelblue",
+                                   "Dual-Platform" = "firebrick"),
+                      name = NULL) +
+    scale_x_continuous(breaks = unique(df$year)) +
+    labs(
+      title    = paste0("Year-Relative Change in ", outcome_label),
+      subtitle = "Ref = 2018 | Point estimate with 95% CI | dotted line = Epic launch",
+      x        = "Year",
+      y        = paste0("Change from 2018 (", outcome_label, ")")
+    ) +
+    theme_fivethirtyeight() +
+    theme(legend.position = "bottom",
+          axis.text.x     = element_text(angle = 45, hjust = 1))
+}
+```
+
+## Generate one plot per outcome
+```{r fig.width=12, fig.height=4.5, echo=TRUE, message=FALSE, warning=FALSE}
+plot_trajectories(plot_long, "Nominal Price")
+```
+
+```{r fig.width=12, fig.height=4.5, echo=TRUE, message=FALSE, warning=FALSE}
+plot_trajectories(plot_long, "Real Price")
+```
+
+```{r fig.width=12, fig.height=4.5, echo=TRUE, message=FALSE, warning=FALSE}
+plot_trajectories(plot_long, "Sale Frequency")
+```
+
+```{r fig.width=12, fig.height=4.5, echo=TRUE, message=FALSE, warning=FALSE}
+plot_trajectories(plot_long, "Discount Depth")
+```
+
+
+***
+# Extra Information and Code
+## Sanity checks on regression data
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+cat("Observations by year:\n")
+reg_data %>% count(year) %>% print()
+
+cat("\nEver on Epic counts:\n")
+reg_data %>%
+  distinct(game_title, ever_on_epic) %>%
+  count(ever_on_epic) %>% print()
+
+cat("\nMonth-of-year distribution:\n")
+reg_data %>% count(month_of_year) %>% print()
+```
+
+## Full Regression Output (No Game FE vs Game FE)
+### Nominal Price — Thesis Table
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+modelsummary(
+  list("No Game FE" = price_models$m1, "Game FE" = price_models$m2),
+  stars       = TRUE,
+  coef_omit   = omit_regex,
+  coef_rename = coef_rename,
+  gof_omit    = "AIC|BIC|Log.Lik|F|RMSE",
+  title       = "Nominal Price: Year-Relative Effects",
+  notes       = "Reference year 2018. Year main effects show market-wide change relative to 2018; year x ever_on_epic interactions show additional differential effect on dual-platform games.",
+  output = "flextable"
+)
+```
+
+### Real Price — Thesis Table
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+modelsummary(
+  list("No Game FE" = realprice_models$m1, "Game FE" = realprice_models$m2),
+  stars       = TRUE,
+  coef_omit   = omit_regex,
+  coef_rename = coef_rename,
+  gof_omit    = "AIC|BIC|Log.Lik|F|RMSE",
+  title       = "Real Price: Year-Relative Effects",
+  notes       = "Reference year 2018.",
+  output = "flextable"
+)
+```
+
+### Sale Frequency — Thesis Table
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+modelsummary(
+  list("No Game FE" = sale_models$m1, "Game FE" = sale_models$m2),
+  stars       = TRUE,
+  coef_omit   = omit_regex,
+  coef_rename = coef_rename,
+  gof_omit    = "AIC|BIC|Log.Lik|F|RMSE",
+  title       = "Sale Frequency: Year-Relative Effects",
+  notes       = "Reference year 2018.",
+  output = "flextable"
+)
+```
+
+### Discount Depth — Thesis Table
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+modelsummary(
+  list("No Game FE" = disc_models$m1, "Game FE" = disc_models$m2),
+  stars       = TRUE,
+  coef_omit   = omit_regex,
+  coef_rename = coef_rename,
+  gof_omit    = "AIC|BIC|Log.Lik|F|RMSE",
+  title       = "Discount Depth: Year-Relative Effects",
+  notes       = "Reference year 2018.",
+  output = "flextable"
+)
+```
+
+## Sample Composition Checks
+### How many months of data for each category
+```{r}
+reg_data %>%
+  group_by(game_title, ever_on_epic) %>%
+  summarise(n_months = n(), .groups = "drop") %>%
+  group_by(ever_on_epic) %>%
+  summarise(mean_months = mean(n_months),
+            median_months = median(n_months),
+            n_games = n())
+```
+
+Treated games are observed for a somewhat shorter panel than controls on 
+average (70 vs. 82 months), but since the treatment interaction is identified 
+off the treated games while the longer panels belong to controls, 
+observation-weighting doesn't tilt the estimated effect.
+
+
+### Treated / Control games by year
+```{r}
+reg_data %>%
+  group_by(year, ever_on_epic) %>%
+  summarise(n_games = n_distinct(game_title), .groups = "drop") %>%
+  pivot_wider(names_from = ever_on_epic, values_from = n_games,
+              names_prefix = "treated_")
+```
+
+The sample grows monotonically from 128 games in 2014 to 900 in 2024 with the 
+treated share rising from ~28% to ~39%, but because treated and control arms 
+grow roughly symmetrically and the interaction is a within-year contrast, this 
+cross-year compositional drift affects both arms comparably rather than driving 
+the estimate.
+
