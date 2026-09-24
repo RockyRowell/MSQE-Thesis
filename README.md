@@ -10,8 +10,8 @@ The game-level results are almost entirely null. Epic's entry exerted no downwar
 
 
 ## Repository Structure
-R-Markdown/     Analysis source (.Rmd)    
-Output/         Knitted PDFs, generated tables, event-study figures    
-Thesis/         Full written thesis and defense slides
+*R-Markdown/*     Analysis source (.Rmd)    
+*Output/*         Knitted PDFs, generated tables, event-study figures    
+*Thesis/*         Full written thesis and defense slides
 
 
